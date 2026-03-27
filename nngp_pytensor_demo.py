@@ -1,3 +1,4 @@
+import arviz as az 
 import pymc as pm 
 import pytensor 
 import pytensor.tensor as pt 
@@ -58,18 +59,21 @@ def compute_B_and_F(coords, neighbor_idx, sigma2, ell):
 
         if k == 0: 
             B_rows.append(pt.zeros(m))
-            F_vals.append(exp_cov(coords[[i]], coords[[i]], sigma2, ell)[0,0]) # scalar 
+            F_vals.append(exp_cov(coords[[i]], coords[[i]], sigma2, ell))  
             continue 
 
-        C_ii = exp_cov(coords[[i]], coords[[i]], sigma2, ell)[0,0] 
+        C_ii = exp_cov(coords[[i]], coords[[i]], sigma2, ell)
         C_i_neighbor = exp_cov(coords[[i]], coords[idx], sigma2, ell) 
+        C_neighbor_i = exp_cov(coords[idx], coords[[i]], sigma2, ell)
         C_neighbor_neighbor = exp_cov(coords[idx], coords[idx], sigma2, ell)
+        C_nn_inv = pt.linalg.inv(C_neighbor_neighbor)
 
-        B_i_vals = pt.linalg.solve(C_neighbor_neighbor.T, C_i_neighbor.T).T.ravel() 
+        B_i_vals = (C_i_neighbor @ C_nn_inv).ravel() 
+        # concatenating with zeros enables stacking later on 
         B_i_padded = pt.concatenate([B_i_vals, pt.zeros(m - k)])
         B_rows.append(B_i_padded) 
 
-        F_i = C_ii - (C_i_neighbor @ pt.linalg.solve(C_neighbor_neighbor, C_i_neighbor.T))[0, 0] 
+        F_i = C_ii - (C_i_neighbor @ C_nn_inv @ C_neighbor_i) 
         F_vals.append(F_i) 
 
     B = pt.stack(B_rows) 
@@ -92,10 +96,10 @@ def nngp_logp(w, neighbor_idx, B, F):
 ### building the model ### 
 with pm.Model() as nngp_model: 
 
-    sigma2 = pm.HalfNormal('sigma2', sigma=2) 
+    sigma2 = pm.InverseGamma('sigma2', alpha=3, beta=1) 
     ell = pm.Gamma('ell', alpha=2, beta=2)
-    w = pm.Normal('w', mu=0, sigma=1, shape=len(coords_sorted))
-
+    w_raw = pm.Normal('w_raw', mu=0, sigma=1, shape=len(coords_sorted)) 
+    w = pm.Deterministic('w', w_raw * pt.sqrt(sigma2))
     B, F = compute_B_and_F(coords_sorted, neighbor_idx, sigma2, ell) 
 
     pm.Potential('nngp', nngp_logp(w, neighbor_idx, B, F)) 
@@ -103,8 +107,14 @@ with pm.Model() as nngp_model:
 pm.model_to_graphviz(nngp_model)
 
 with nngp_model:
-    trace = pm.sample(100, tune=100, chains=1, random_seed=76, nuts_sampler='numpyro')
-# 0.04 step size with 92% acceptance prob! 
+    trace = pm.sample(
+        draws=1000, tune=1000, chains=4, cores=4, 
+        random_seed=76, nuts_sampler='numpyro', 
+        target_accept = 0.95
+    )
+
+az.summary(trace, var_names=['sigma2','ell'])
+az.plot_pair(trace, var_names=['sigma2','ell'], divergences=True)
 
 
 
