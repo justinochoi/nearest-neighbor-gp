@@ -30,7 +30,7 @@ def exp_cov(coords_a, coords_b, sigma2, ell):
 
     return sigma2 * pt.exp(-D / ell)
 
-def make_synthetic_data(n=50, sigma2=1.0, ell=0.3, seed=76): 
+def make_synthetic_data(n, sigma2=1.0, ell=0.3, seed=76): 
     rng = np.random.default_rng(seed)
     coords = rng.uniform(0, 1, size = (n, 2)) 
     D = cdist(coords, coords) 
@@ -41,93 +41,112 @@ def make_synthetic_data(n=50, sigma2=1.0, ell=0.3, seed=76):
     return coords, w, C
 
 ### generating data ### 
-coords, w, C = make_synthetic_data() 
+coords, w, C = make_synthetic_data(n=50) 
 order = np.argsort(coords[:, 0]) 
 coords_sorted = coords[order] 
 w_sorted = w[order] 
 neighbor_idx = build_neighbor_array(coords=coords_sorted, m=10)
+neighbor_idx_safe = np.where(neighbor_idx == -1, 0, neighbor_idx).astype(int)
+neighbor_mask = (neighbor_idx != -1).astype(float) 
 
-### functions required to evaulate NNGP ### 
-def compute_B_and_F(coords, neighbor_idx, sigma2, ell): 
-    n, m = neighbor_idx.shape 
-    B_rows = [] 
-    F_vals = [] 
+def B_and_F_step(coords_i, neighbor_idx_i, mask_i, coords, sigma2, ell):
+    m = neighbor_idx_i.shape[0] 
+    
+    # covariance computations - always use all m neighbors
+    C_ii = exp_cov(coords_i[None], coords_i[None], sigma2, ell)
+    C_i_neighbor = exp_cov(coords_i[None], coords[neighbor_idx_i], sigma2, ell)  # (1, m)
+    C_neighbor_i = exp_cov(coords[neighbor_idx_i], coords_i[None], sigma2, ell)  # (m, 1)
+    C_neighbor_neighbor = exp_cov(coords[neighbor_idx_i], coords[neighbor_idx_i], sigma2, ell)  # (m, m)
+    
+    # mask out invalid neighbor contributions
+    mask_2d = mask_i[:, None] * mask_i[None, :]  # (m, m)
+    C_i_neighbor_masked = C_i_neighbor * mask_i[None, :]
+    C_neighbor_i_masked = C_neighbor_i * mask_i[:, None]
+    C_neighbor_neighbor_masked = C_neighbor_neighbor * mask_2d
+    
+    # keep matrix invertible for invalid entries
+    C_neighbor_neighbor_safe = (
+        C_neighbor_neighbor_masked 
+        + pt.diag(1 - mask_i)
+        + 1e-6 * pt.eye(m)
+    )
+    
+    C_nn_inv = pt.linalg.inv(C_neighbor_neighbor_safe)
+    
+    B_i = (C_i_neighbor_masked @ C_nn_inv).ravel() * mask_i
+    F_i = C_ii - (C_i_neighbor_masked @ C_nn_inv @ C_neighbor_i_masked)
+    
+    return B_i, F_i
 
-    for i in range(n): 
-        idx = neighbor_idx[i][neighbor_idx[i] != -1] 
-        k = len(idx) 
+def compute_B_and_F(coords_sorted, neighbor_idx_safe, neighbor_mask, sigma2, ell):
+    coords_const = pt.constant(coords_sorted)
+    neighbor_idx_const = pt.constant(neighbor_idx_safe)
+    mask_const = pt.constant(neighbor_mask) 
+    (B, F), _ = pytensor.scan(
+        fn=B_and_F_step,
+        sequences=[coords_const, neighbor_idx_const, mask_const],
+        non_sequences=[coords_const, sigma2, ell]
+    )
+    return B, F
 
-        if k == 0: 
-            B_rows.append(pt.zeros(m))
-            F_vals.append(exp_cov(coords[[i]], coords[[i]], sigma2, ell))  
-            continue 
+def w_step(i, w_raw_i, neighbor_idx_i, mask_i, B_i, F_i, w_prev):
+    w_i = pt.dot(B_i * mask_i, w_prev[neighbor_idx_i]) + pt.sqrt(F_i) * w_raw_i
+    w_new = pt.set_subtensor(w_prev[i], w_i)
+    return w_new
 
-        C_ii = exp_cov(coords[[i]], coords[[i]], sigma2, ell)
-        C_i_neighbor = exp_cov(coords[[i]], coords[idx], sigma2, ell) 
-        C_neighbor_i = exp_cov(coords[idx], coords[[i]], sigma2, ell)
-        C_neighbor_neighbor = exp_cov(coords[idx], coords[idx], sigma2, ell)
-        C_nn_inv = pt.linalg.inv(C_neighbor_neighbor)
-
-        B_i_vals = (C_i_neighbor @ C_nn_inv).ravel() 
-        # concatenating with zeros enables stacking later on 
-        B_i_padded = pt.concatenate([B_i_vals, pt.zeros(m - k)])
-        B_rows.append(B_i_padded) 
-
-        F_i = C_ii - (C_i_neighbor @ C_nn_inv @ C_neighbor_i) 
-        F_vals.append(F_i) 
-
-    B = pt.stack(B_rows) 
-    F = pt.stack(F_vals) 
-
-    return B, F 
-
-def nngp_logp(w, neighbor_idx, B, F): 
-    log_lik = 0 
-
-    for i in range(neighbor_idx.shape[0]): # TensorVariables have no len() 
-        idx = neighbor_idx[i][neighbor_idx[i] != -1] 
-        resid = w[i] - B[i, :len(idx)] @ w[idx]
-        term = -0.5 * pt.log(2*pt.pi) - 0.5 * pt.log(F[i]) - 0.5 * pt.square(resid) / F[i] 
-        log_lik += term 
-
-    return log_lik 
-
+def transform_w(w_raw, neighbor_idx_safe, neighbor_mask, B, F, n):
+    indices_const = pt.constant(np.arange(n, dtype=int))
+    neighbor_idx_const = pt.constant(neighbor_idx_safe)
+    mask_const = pt.constant(neighbor_mask) 
+    w_init = pt.zeros(n)
+    
+    w, _ = pytensor.scan(
+        fn=w_step,
+        sequences=[indices_const, w_raw, neighbor_idx_const, mask_const, B, F],
+        outputs_info=[w_init]
+    )
+    return w[-1]
 
 ### building the model ### 
 with pm.Model() as nngp_model: 
 
-    sigma2 = pm.InverseGamma('sigma2', alpha=3, beta=1) 
+    n = len(coords_sorted)
+    sigma2 = pm.InverseGamma('sigma2', alpha=3, beta=1)
     ell = pm.Gamma('ell', alpha=2, beta=2)
-    w_raw = pm.Normal('w_raw', mu=0, sigma=1, shape=len(coords_sorted)) 
-    w = pm.Deterministic('w', w_raw * pt.sqrt(sigma2))
-    B, F = compute_B_and_F(coords_sorted, neighbor_idx, sigma2, ell) 
-
-    pm.Potential('nngp', nngp_logp(w, neighbor_idx, B, F)) 
+    w_raw = pm.Normal('w_raw', mu=0, sigma=1, shape=n)
+    B, F = compute_B_and_F(coords_sorted, neighbor_idx_safe, 
+                                 neighbor_mask, sigma2, ell)
+    w = pm.Deterministic('w', transform_w(w_raw, neighbor_idx_safe, 
+                                          neighbor_mask, B, F, n))
 
 pm.model_to_graphviz(nngp_model)
 
 with nngp_model:
     trace = pm.sample(
-        draws=1000, tune=1000, chains=4, cores=4, 
+        draws=500, tune=500, chains=4, cores=4, 
         random_seed=76, nuts_sampler='numpyro', 
-        target_accept = 0.95
+        target_accept=0.95
     )
 
 az.summary(trace, var_names=['sigma2','ell'])
-az.plot_pair(trace, var_names=['sigma2','ell'], divergences=True)
+az.plot_pair(trace, var_names=['sigma2','ell'])
 
+### compare with GP ### 
+with pm.Model() as full_gp: 
 
+    sigma2 = pm.InverseGamma('sigma2', alpha=3, beta=1)
+    ell = pm.Gamma('ell', alpha=2, beta=2)
+    cov_func = sigma2 * pm.gp.cov.Matern12(2, ls=ell)
+    gp = pm.gp.Latent(cov_func=cov_func)
+    w = gp.prior('w', X=coords_sorted)
 
+pm.model_to_graphviz(full_gp)
 
-### tests ### 
-# test that the exp_cov function works properly 
-sigma2_test = pt.scalar('sigma2')
-ell_test = pt.scalar('ell')
+with full_gp: 
+    gp_trace = pm.sample(
+        draws=500, tune=500, chains=4, cores=4, 
+        random_seed=76, nuts_sampler='numpyro', 
+        target_accept=0.95
+    )
 
-C_test = exp_cov(coords_sorted[:3], coords_sorted[:3], sigma2_test, ell_test)
-f = pytensor.function([sigma2_test, ell_test], C_test)
-print(f(1.0, 0.3))
-
-
-
-        
+az.summary(gp_trace, var_names=['sigma2','ell'])
