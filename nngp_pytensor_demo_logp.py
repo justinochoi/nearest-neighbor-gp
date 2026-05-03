@@ -36,14 +36,15 @@ def make_synthetic_data(n, sigma2=1.0, ell=0.3, seed=76):
     C = sigma2 * np.exp(-D / ell) # exponential quadratic 
     C += 1e-6 * np.eye(n) # numerical stability 
     w = rng.multivariate_normal(np.zeros(n), C) 
+    y = rng.normal(w, 1)
 
-    return coords, w, C
+    return coords, y 
 
 ### generating data ### 
-coords, w, C = make_synthetic_data(n=50) 
+coords, y = make_synthetic_data(n=50) 
 order = np.argsort(coords[:, 0]) 
 coords_sorted = coords[order] 
-w_sorted = w[order] 
+y_sorted = y[order]
 neighbor_idx = build_neighbor_array(coords=coords_sorted, m=10)
 
 ### functions required to evaulate NNGP ### 
@@ -98,20 +99,22 @@ with pm.Model() as nngp_model:
     sigma2 = pm.InverseGamma('sigma2', alpha=3, beta=1)
     ell = pm.Gamma('ell', alpha=2, beta=2)
     w_raw = pm.Normal('w_raw', mu=0, sigma=1, shape=n)
-    w = pm.Determinstic('w', w_raw * 5) 
+    w = pm.Deterministic('w', w_raw * 5) 
     B, F = compute_B_and_F(coords_sorted, neighbor_idx, sigma2, ell) 
-    pm.Potential('nngp', nngp_logp(w, neighbor_idx, B, F))
+    pm.Potential('nngp', nngp_logp(w, neighbor_idx, B, F)) 
+    tau = pm.HalfNormal('tau', sigma=1)
+    y = pm.Normal('y', mu=w, sigma=tau, observed=y_sorted)
 
 pm.model_to_graphviz(nngp_model)
 
 with nngp_model:
     trace = pm.sample(
-        draws=500, tune=500, chains=4, cores=4, 
+        draws=1000, tune=1000, chains=4, cores=4, 
         random_seed=76, nuts_sampler='numpyro', 
         target_accept=0.95
     )
 
-az.summary(trace, var_names=['sigma2','ell'])
+az.summary(trace, var_names=['sigma2','ell','tau'])
 
 ### compare with GP ### 
 with pm.Model() as full_gp: 
@@ -121,14 +124,15 @@ with pm.Model() as full_gp:
     cov_func = sigma2 * pm.gp.cov.Matern12(2, ls=ell)
     gp = pm.gp.Latent(cov_func=cov_func)
     w = gp.prior('w', X=coords_sorted)
+    tau = pm.HalfNormal('tau', sigma=1)
+    y = pm.Normal('y', mu=w, sigma=tau, observed=y_sorted)
 
 pm.model_to_graphviz(full_gp)
 
 with full_gp: 
     gp_trace = pm.sample(
-        draws=500, tune=500, chains=4, cores=4, 
-        random_seed=76, nuts_sampler='numpyro', 
-        target_accept=0.95
+        draws=1000, tune=1000, chains=4, cores=4, 
+        random_seed=76, nuts_sampler='numpyro'
     )
 
-az.summary(gp_trace, var_names=['sigma2','ell'])
+az.summary(gp_trace, var_names=['sigma2','ell','tau'])

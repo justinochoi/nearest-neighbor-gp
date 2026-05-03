@@ -37,14 +37,16 @@ def make_synthetic_data(n, sigma2=1.0, ell=0.3, seed=76):
     C = sigma2 * np.exp(-D / ell) # exponential quadratic 
     C += 1e-6 * np.eye(n) # numerical stability 
     w = rng.multivariate_normal(np.zeros(n), C) 
+    y = rng.normal(w, 1)
 
-    return coords, w, C
+    return coords, y 
 
 ### generating data ### 
-coords, w, C = make_synthetic_data(n=50) 
+coords, y = make_synthetic_data(n=500) 
 order = np.argsort(coords[:, 0]) 
 coords_sorted = coords[order] 
-w_sorted = w[order] 
+y_sorted = y[order]
+
 neighbor_idx = build_neighbor_array(coords=coords_sorted, m=10)
 neighbor_idx_safe = np.where(neighbor_idx == -1, 0, neighbor_idx).astype(int)
 neighbor_mask = (neighbor_idx != -1).astype(float) 
@@ -53,7 +55,7 @@ def B_and_F_step(coords_i, neighbor_idx_i, mask_i, coords, sigma2, ell):
     m = neighbor_idx_i.shape[0] 
     
     # covariance computations - always use all m neighbors
-    C_ii = exp_cov(coords_i[None], coords_i[None], sigma2, ell)
+    C_ii = exp_cov(coords_i[None], coords_i[None], sigma2, ell)[0,0]
     C_i_neighbor = exp_cov(coords_i[None], coords[neighbor_idx_i], sigma2, ell)  # (1, m)
     C_neighbor_i = exp_cov(coords[neighbor_idx_i], coords_i[None], sigma2, ell)  # (m, 1)
     C_neighbor_neighbor = exp_cov(coords[neighbor_idx_i], coords[neighbor_idx_i], sigma2, ell)  # (m, m)
@@ -74,7 +76,7 @@ def B_and_F_step(coords_i, neighbor_idx_i, mask_i, coords, sigma2, ell):
     C_nn_inv = pt.linalg.inv(C_neighbor_neighbor_safe)
     
     B_i = (C_i_neighbor_masked @ C_nn_inv).ravel() * mask_i
-    F_i = C_ii - (C_i_neighbor_masked @ C_nn_inv @ C_neighbor_i_masked)
+    F_i = C_ii - (C_i_neighbor_masked @ C_nn_inv @ C_neighbor_i_masked)[0,0]
     
     return B_i, F_i
 
@@ -110,43 +112,69 @@ def transform_w(w_raw, neighbor_idx_safe, neighbor_mask, B, F, n):
 ### building the model ### 
 with pm.Model() as nngp_model: 
 
-    n = len(coords_sorted)
+    n = coords_sorted.shape[0]
     sigma2 = pm.InverseGamma('sigma2', alpha=3, beta=1)
     ell = pm.Gamma('ell', alpha=2, beta=2)
+    
     w_raw = pm.Normal('w_raw', mu=0, sigma=1, shape=n)
-    B, F = compute_B_and_F(coords_sorted, neighbor_idx_safe, 
-                                 neighbor_mask, sigma2, ell)
-    w = pm.Deterministic('w', transform_w(w_raw, neighbor_idx_safe, 
-                                          neighbor_mask, B, F, n))
+    B, F = compute_B_and_F(coords_sorted, neighbor_idx_safe, neighbor_mask, sigma2, ell)
+    w = pm.Deterministic('w', transform_w(w_raw, neighbor_idx_safe, neighbor_mask, B, F, n))
+    
+    tau = pm.HalfNormal('tau', sigma=1)
+    pm.Normal('y_obs', mu=w, sigma=tau, observed=y_sorted)
 
 pm.model_to_graphviz(nngp_model)
 
 with nngp_model:
     trace = pm.sample(
-        draws=500, tune=500, chains=4, cores=4, 
-        random_seed=76, nuts_sampler='numpyro', 
-        target_accept=0.95
+        draws=1000, tune=1000, chains=4, cores=4, 
+        random_seed=76, nuts_sampler='numpyro'
     )
 
-az.summary(trace, var_names=['sigma2','ell'])
-az.plot_pair(trace, var_names=['sigma2','ell'])
+az.summary(trace, var_names=['sigma2','ell','tau'])
 
-### compare with GP ### 
+pm.gp.hsgp_approx.approx_hsgp_hyperparams(
+    x_range = [0,1], 
+    lengthscale_range = [2,4], 
+    cov_func = 'expquad'
+)
+### compare with HSGP ### 
+with pm.Model() as hsgp: 
+    sigma2 = pm.InverseGamma('sigma2', alpha=3, beta=1)
+    ell = pm.Gamma('ell', alpha=2, beta=2)
+    cov_func = sigma2 * pm.gp.cov.ExpQuad(2, ls=ell)
+    gp = pm.gp.HSGP(m=[11,11], c=7, cov_func=cov_func)
+    w = gp.prior('w', X=coords_sorted) 
+    tau = pm.HalfNormal('tau', sigma=1)
+    y = pm.Normal('y', mu=w, sigma=tau, observed=y_sorted) 
+
+pm.model_to_graphviz(hsgp) 
+
+with hsgp: 
+    hsgp_trace = pm.sample(
+        tune=1000, draws=1000, chains=4, cores=4, 
+        random_seed=76, nuts_sampler='numpyro'
+    )
+    
+az.summary(hsgp_trace, var_names=['sigma2','ell','tau']) 
+
+### compare with full GP ### 
 with pm.Model() as full_gp: 
 
     sigma2 = pm.InverseGamma('sigma2', alpha=3, beta=1)
     ell = pm.Gamma('ell', alpha=2, beta=2)
-    cov_func = sigma2 * pm.gp.cov.Matern12(2, ls=ell)
+    cov_func = sigma2 * pm.gp.cov.ExpQuad(2, ls=ell)
     gp = pm.gp.Latent(cov_func=cov_func)
-    w = gp.prior('w', X=coords_sorted)
+    w = gp.prior('w', X=coords_sorted) 
+    tau = pm.HalfNormal('tau', sigma=1)
+    y = pm.Normal('y', mu=w, sigma=tau, observed=y_sorted) 
 
 pm.model_to_graphviz(full_gp)
 
 with full_gp: 
     gp_trace = pm.sample(
-        draws=500, tune=500, chains=4, cores=4, 
-        random_seed=76, nuts_sampler='numpyro', 
-        target_accept=0.95
+        draws=1000, tune=1000, chains=4, cores=4, 
+        random_seed=76, nuts_sampler='numpyro'
     )
 
-az.summary(gp_trace, var_names=['sigma2','ell'])
+az.summary(gp_trace, var_names=['sigma2','ell','tau'])
