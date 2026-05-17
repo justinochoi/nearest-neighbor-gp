@@ -6,7 +6,6 @@ import numpy as np
 from scipy.spatial import KDTree 
 from scipy.spatial.distance import cdist 
 from scipy.linalg import solve_triangular 
-from scipy.stats import multivariate_normal
 
 ### helper functions ### 
 def get_NNind(coords, m): 
@@ -79,24 +78,17 @@ def nngp_response_logp(X, y, m, beta, sigma, tau, ell, NNind, NNdist, NNdistM):
     kappa = tau**2 / sigma**2 + 1 
 
     for i in range(1, n): 
-        if i < (m + 1):
-            iNNdistM = np.full((i-1, i-1), 0.0) 
-            dim = i - 1 
-        else: 
-            iNNdistM = np.full((m, m), 0.0) 
-            dim = m 
-        if dim == 0: 
-            V[i] = kappa 
-            continue 
-        else: 
-            h = 0 
-            # this ordering is flipped from original stan example 
-            # because np.tril_indices gives row-major order 
-            for k in range(dim): 
-                for j in range(k+1, dim): 
-                    iNNdistM[j, k] = np.exp(- NNdistM[(i-1), h] / ell)
-                    iNNdistM[k, j] = iNNdistM[j, k]
-                    h += 1 
+        dim = min(m, i)
+        iNNdistM = np.full((dim, dim), 0.0)
+
+        h = 0 
+        # this ordering is flipped from original stan example 
+        # because np.tril_indices gives row-major order 
+        for j in range(dim): 
+            for k in range(j): 
+                iNNdistM[j, k] = np.exp(- NNdistM[(i-1), h] / ell)
+                iNNdistM[k, j] = iNNdistM[j, k]
+                h += 1 
 
         for j in range(dim): 
             iNNdistM[j, j] = kappa 
@@ -108,14 +100,13 @@ def nngp_response_logp(X, y, m, beta, sigma, tau, ell, NNind, NNdist, NNdistM):
         V[i] = kappa - np.dot(v, v)
         v2 = solve_triangular(iNNCholL, v.T, lower=True, trans='T').T 
         U[i] = U[i] - v2 @ resid[NNind[(i-1), :dim]]
-        print(f"V_val: {V[i]}, U_update: {U[i]}")
     
     V[0] = kappa 
     return -0.5 * (1/sigma**2 * np.dot(U, U/V) + np.sum(np.log(V)) + n*np.log(sigma**2))
 
 # generate synthetic data and verify against scipy 
 # true parameters
-n = 500 
+n = 5000
 m = 10 
 sigma = 1.0
 tau = 1.0
@@ -133,15 +124,6 @@ X_sorted = X[order]
 NNind = get_NNind(coords_sorted, m=10) 
 NNdist = get_NNdist(coords_sorted, NNind, m=10) 
 NNdistM = get_NNdistM(coords_sorted, NNind, m=10)
-
-full_logp = multivariate_normal.logpdf(y_sorted, mean=X @ beta, cov=C)
-nngp_logp = nngp_response_logp(X_sorted, y_sorted, m, beta, sigma, tau, ell, 
-                                NNind, NNdist, NNdistM)
-
-print(f"Full GP: {full_logp:.4f}")
-print(f"NNGP response: {nngp_logp:.4f}")
-print(f"Difference: {abs(full_logp - nngp_logp):.4f}")
-
 
 def nngp_response_step(NNdist_i, NNdistM_i, NNind_i, mask_i, 
                         resid, sigma, tau, ell, tril_rows, tril_cols):
@@ -167,7 +149,7 @@ def nngp_response_step(NNdist_i, NNdistM_i, NNind_i, mask_i,
     
     v2 = pt.linalg.solve_triangular(iNNCholL, v, lower=True, trans='T')
     U_i_update = pt.dot(v2, resid[NNind_i] * mask_i)
-    
+
     return V_i, U_i_update
 
 def nngp_response_logp_pt(X, y, m, beta, sigma, tau, ell,
@@ -224,12 +206,10 @@ pt_val = f(np.array(beta), sigma, tau, ell)
 np_val = nngp_response_logp(X_sorted, y_sorted, m, beta, sigma, tau, ell,
                              NNind, NNdist, NNdistM)
 
+# these are identical 
 print(f"Pytensor: {pt_val:.4f}")
-print(f"NumPy: {np_val:.4f}")
+print(f"NumPy: {np_val:.4f}") 
 print(f"Difference: {abs(pt_val - np_val):.6f}")
-
-# very close but off by a little bit... 
-# need to investigate later 
 
 with pm.Model() as nngp: 
     
@@ -249,8 +229,30 @@ with pm.Model() as nngp:
 
 pm.model_to_graphviz(nngp) 
 
-# around 40 sec! 
 with nngp: 
-    trace = pm.sample(chains=4, cores=4, random_seed=76, nuts_sampler='numpyro')
+    nngp_trace = pm.sample(chains=4, cores=4, random_seed=76, nuts_sampler='numpyro')
 
-az.summary(trace)
+az.summary(nngp_trace)
+
+# compare against full gp 
+with pm.Model() as gp_version: 
+
+    beta = pm.Normal('beta', mu=0, sigma=1, shape=2)
+    sigma = pm.InverseGamma('sigma', alpha=3, beta=1)
+    ell = pm.Gamma('ell', alpha=2, beta=2)
+    tau = pm.HalfNormal('tau', sigma=1) 
+
+    cov_func = pt.square(sigma) * pm.gp.cov.ExpQuad(2, ls=ell) 
+    gp = pm.gp.Latent(cov_func=cov_func) 
+    f = gp.prior('f', X=X_sorted) 
+    y = pm.Normal('y', mu = f + pt.dot(X_sorted, beta), sigma=tau, observed=y_sorted)
+
+pm.model_to_graphviz(gp_version) 
+
+with gp_version: 
+    gp_trace = pm.sample(chains=4, cores=4, random_seed=76, nuts_sampler='numpyro')
+
+az.summary(gp_trace, var_names=['beta','sigma','ell','tau'])
+
+# similar results but nngp has much higher ESS (when n = 50)
+# using n = 5000, nngp only took about 10 mins! 
