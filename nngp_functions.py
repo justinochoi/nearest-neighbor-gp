@@ -3,6 +3,7 @@ import pymc as pm
 import pytensor 
 import pytensor.tensor as pt 
 import numpy as np 
+import xarray as xr 
 from scipy.spatial import KDTree 
 from scipy.spatial.distance import cdist 
 
@@ -154,7 +155,7 @@ if __name__ == '__main__':
         )
 
     with nngp: 
-        nngp_trace = pm.sample(chains=4, cores=4, random_seed=76, nuts_sampler='numpyro')
+        nngp_trace = pm.sample(chains=4, cores=4, random_seed=76, nuts_sampler='nutpie')
 
-    az.to_netcdf(nngp_trace, 'toy_example_nngp_trace.nc')
-    az.summary(nngp)
+    nngp_trace.to_netcdf('toy_example_nngp_trace.nc')
+    az.summary(nngp_trace)
