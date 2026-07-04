@@ -3,6 +3,7 @@ import pymc as pm
 import pytensor 
 import pytensor.tensor as pt 
 import numpy as np 
+import preliz as pz 
 from scipy.spatial import KDTree 
 from scipy.spatial.distance import cdist 
 from scipy.linalg import solve_triangular 
@@ -230,12 +231,18 @@ with pm.Model() as nngp:
 pm.model_to_graphviz(nngp) 
 
 with nngp: 
-    nngp_trace = pm.sample(chains=4, cores=4, random_seed=76, nuts_sampler='numpyro')
+    nngp_trace = pm.sample(chains=4, cores=4, random_seed=76, nuts_sampler='nutpie')
 
 az.summary(nngp_trace)
 
-# compare against full gp 
-with pm.Model() as gp_version: 
+m_approx, c_approx = pm.gp.hsgp_approx.approx_hsgp_hyperparams(
+    x_range = [0,1], 
+    lengthscale_range=[1,10], 
+    cov_func="expquad"
+)
+
+# compare against hsgp 
+with pm.Model() as hsgp: 
 
     beta = pm.Normal('beta', mu=0, sigma=1, shape=2)
     sigma = pm.InverseGamma('sigma', alpha=3, beta=1)
@@ -243,16 +250,17 @@ with pm.Model() as gp_version:
     tau = pm.HalfNormal('tau', sigma=1) 
 
     cov_func = pt.square(sigma) * pm.gp.cov.ExpQuad(2, ls=ell) 
-    gp = pm.gp.Latent(cov_func=cov_func) 
-    f = gp.prior('f', X=X_sorted) 
+    gp = pm.gp.HSGP(
+        m = [m_approx, m_approx],
+        c = c_approx, 
+        cov_func = cov_func 
+    )
+    f = gp.prior('f', X=coords_sorted)  
     y = pm.Normal('y', mu = f + pt.dot(X_sorted, beta), sigma=tau, observed=y_sorted)
 
-pm.model_to_graphviz(gp_version) 
+pm.model_to_graphviz(hsgp)
 
-with gp_version: 
-    gp_trace = pm.sample(chains=4, cores=4, random_seed=76, nuts_sampler='numpyro')
+with hsgp: 
+    hsgp_trace = pm.sample(chains=4, cores=4, random_seed=76, tune=1000, draws=2000, nuts_sampler='nutpie')
 
-az.summary(gp_trace, var_names=['beta','sigma','ell','tau'])
-
-# similar results but nngp has much higher ESS (when n = 50)
-# using n = 5000, nngp only took about 10 mins! 
+az.summary(hsgp_trace, var_names=['beta','sigma','ell','tau'])
