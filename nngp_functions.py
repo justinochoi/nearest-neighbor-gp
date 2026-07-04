@@ -1,4 +1,3 @@
-import arviz as az 
 import pymc as pm 
 import pytensor 
 import pytensor.tensor as pt 
@@ -116,7 +115,6 @@ def nngp_response_logp_pt(X, y, m, beta, sigma, tau, ell,
     
     return -0.5 * (1/sigma**2 * pt.dot(U, U/V) + pt.sum(pt.log(V)) + n*pt.log(sigma**2))
 
-# only runs when file is executed directly 
 if __name__ == '__main__': 
     # toy example 
     n = 5000

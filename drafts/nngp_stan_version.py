@@ -3,7 +3,6 @@ import pymc as pm
 import pytensor 
 import pytensor.tensor as pt 
 import numpy as np 
-import preliz as pz 
 from scipy.spatial import KDTree 
 from scipy.spatial.distance import cdist 
 from scipy.linalg import solve_triangular 
@@ -116,7 +115,7 @@ beta = [1,2]
 
 coords, C, X, y = make_synthetic_data(
     n, beta, tau, sigma, ell, seed = 76
-) 
+)
 order = np.argsort(coords[:, 0]) 
 coords_sorted = coords[order] 
 y_sorted = y[order]
@@ -237,7 +236,7 @@ az.summary(nngp_trace)
 
 m_approx, c_approx = pm.gp.hsgp_approx.approx_hsgp_hyperparams(
     x_range = [0,1], 
-    lengthscale_range=[1,10], 
+    lengthscale_range=[10,20], 
     cov_func="expquad"
 )
 
@@ -261,6 +260,6 @@ with pm.Model() as hsgp:
 pm.model_to_graphviz(hsgp)
 
 with hsgp: 
-    hsgp_trace = pm.sample(chains=4, cores=4, random_seed=76, tune=1000, draws=2000, nuts_sampler='nutpie')
+    hsgp_trace = pm.sample(chains=4, cores=4, random_seed=76, nuts_sampler='nutpie')
 
 az.summary(hsgp_trace, var_names=['beta','sigma','ell','tau'])

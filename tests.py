@@ -1,72 +1,155 @@
-import pytensor
-import pytensor.tensor as pt
-import numpy as np
+import arviz as az 
+import pymc as pm 
+import pytensor 
+import pytensor.tensor as pt 
+import numpy as np 
+from scipy.spatial import KDTree 
+from scipy.spatial.distance import cdist 
+from scipy.linalg import solve_triangular 
+from nngp_functions import get_NNind, get_NNdist, get_NNdistM, make_synthetic_data
 
-# test inputs as plain numpy
-coords_test = coords_sorted[:5]
-neighbor_idx_test = neighbor_idx_safe[:5]
-mask_test = neighbor_mask[:5]
+# test that the pytensor and numpy implementations line up 
+def nngp_response_logp(X, y, m, beta, sigma, tau, ell, NNind, NNdist, NNdistM): 
+    
+    v = [] 
+    v2 = [] 
+    iNNcorr = []
+    n = len(y)
 
-sigma2_test = pt.dscalar('sigma2')
-ell_test = pt.dscalar('ell')
+    resid = y - np.dot(X, beta) 
+    U = resid.copy() 
+    V = np.zeros(n)
+    kappa = tau**2 / sigma**2 + 1 
 
-n = 5  # plain python int
+    for i in range(1, n): 
+        dim = min(m, i)
+        iNNdistM = np.full((dim, dim), 0.0)
 
-coords_const = pytensor.tensor.constant(coords_test)
-neighbor_idx_const = pytensor.tensor.constant(neighbor_idx_test)
-mask_const = pytensor.tensor.constant(mask_test)
+        h = 0 
+        # this ordering is flipped from original stan example 
+        # because np.tril_indices gives row-major order 
+        for j in range(dim): 
+            for k in range(j): 
+                iNNdistM[j, k] = np.exp(- NNdistM[(i-1), h] / ell)
+                iNNdistM[k, j] = iNNdistM[j, k]
+                h += 1 
 
-(B_test, F_test), _ = pytensor.scan(
-    fn=B_and_F_step,
-    sequences=[coords_const, neighbor_idx_const, mask_const],
-    non_sequences=[coords_const, sigma2_test, ell_test]
+        for j in range(dim): 
+            iNNdistM[j, j] = kappa 
+        
+        iNNCholL = np.linalg.cholesky(iNNdistM)
+        iNNcorr = np.exp(- NNdist[(i-1), :dim] / ell)
+        
+        v = solve_triangular(iNNCholL, iNNcorr, lower=True) 
+        V[i] = kappa - np.dot(v, v)
+        v2 = solve_triangular(iNNCholL, v.T, lower=True, trans='T').T 
+        U[i] = U[i] - v2 @ resid[NNind[(i-1), :dim]]
+    
+    V[0] = kappa 
+    return -0.5 * (1/sigma**2 * np.dot(U, U/V) + np.sum(np.log(V)) + n*np.log(sigma**2))
+
+# true parameters
+n = 5000
+m = 10 
+sigma = 1.0
+tau = 1.0
+ell = 0.3
+beta = [1,2]
+
+coords, C, X, y = make_synthetic_data(
+    n, beta, tau, sigma, ell, seed = 76
+)
+order = np.argsort(coords[:, 0]) 
+coords_sorted = coords[order] 
+y_sorted = y[order]
+X_sorted = X[order] 
+
+NNind = get_NNind(coords_sorted, m=10) 
+NNdist = get_NNdist(coords_sorted, NNind, m=10) 
+NNdistM = get_NNdistM(coords_sorted, NNind, m=10)
+
+def nngp_response_step(NNdist_i, NNdistM_i, NNind_i, mask_i, 
+                        resid, sigma, tau, ell, tril_rows, tril_cols):
+    
+    kappa = tau**2 / sigma**2 + 1
+    
+    off_diag = pt.exp(-NNdistM_i / ell)
+    
+    iNNdistM = pt.zeros((m, m))  # m is a plain Python int here
+    iNNdistM = pt.set_subtensor(iNNdistM[tril_rows, tril_cols], off_diag)
+    iNNdistM = iNNdistM + iNNdistM.T
+    
+    mask_2d = mask_i[:, None] * mask_i[None, :]
+    iNNdistM = iNNdistM * mask_2d
+    iNNdistM = pt.set_subtensor(iNNdistM[pt.arange(m), pt.arange(m)],
+                                 pt.where(mask_i > 0, kappa, 1.0))
+    
+    iNNCholL = pt.linalg.cholesky(iNNdistM)
+    iNNcorr = pt.exp(-NNdist_i / ell) * mask_i
+    
+    v = pt.linalg.solve_triangular(iNNCholL, iNNcorr, lower=True)
+    V_i = kappa - pt.dot(v, v)
+    
+    v2 = pt.linalg.solve_triangular(iNNCholL, v, lower=True, trans='T')
+    U_i_update = pt.dot(v2, resid[NNind_i] * mask_i)
+
+    return V_i, U_i_update
+
+def nngp_response_logp_pt(X, y, m, beta, sigma, tau, ell,
+                           NNind_const, NNdist_const, NNdistM_const,
+                           mask_const):
+    n = y.shape[0]
+    resid = y - pt.dot(X, beta)
+    kappa = tau**2 / sigma**2 + 1
+    
+    tril_rows_const = pt.constant(np.tril_indices(m, k=-1)[0])
+    tril_cols_const = pt.constant(np.tril_indices(m, k=-1)[1])
+    
+    (V_vals, U_updates), _ = pytensor.scan(
+        fn=nngp_response_step,
+        sequences=[NNdist_const, NNdistM_const, NNind_const, mask_const],
+        non_sequences=[resid, sigma, tau, ell, tril_rows_const, tril_cols_const],
+    )
+    
+    U = pt.concatenate([[resid[0]], resid[1:] - U_updates])
+    V = pt.concatenate([[kappa], V_vals])
+    
+    return -0.5 * (1/sigma**2 * pt.dot(U, U/V) + pt.sum(pt.log(V)) + n*pt.log(sigma**2))
+
+# symbolic inputs
+sigma_sym = pt.dscalar('sigma')
+tau_sym = pt.dscalar('tau')
+ell_sym = pt.dscalar('ell')
+beta_sym = pt.dvector('beta')
+
+# constants - preprocessing arrays
+NNind_const = pt.constant(NNind.astype(int))
+NNdist_const = pt.constant(NNdist)
+NNdistM_const = pt.constant(NNdistM)
+mask = (NNind != -1).astype(float)
+mask_const = pt.constant(mask)
+
+# data constants
+X_const = pt.constant(X_sorted)
+y_const = pt.constant(y_sorted)
+
+# build symbolic log likelihood
+logp_sym = nngp_response_logp_pt(
+    X=X_const, y=y_const, m=m, beta=beta_sym, sigma=sigma_sym, 
+    tau=tau_sym, ell=ell_sym, NNind_const=NNind_const, 
+    NNdistM_const = NNdistM_const, 
+    NNdist_const=NNdist_const, mask_const=mask_const
 )
 
-f = pytensor.function([sigma2_test, ell_test], [B_test, F_test])
-print(f(1.0, 0.3))
+# compile
+f = pytensor.function([beta_sym, sigma_sym, tau_sym, ell_sym], logp_sym)
 
-# test that the exp_cov function works properly 
-sigma2_test = pt.scalar('sigma2')
-ell_test = pt.scalar('ell')
+# evaluate at true parameters
+pt_val = f(np.array(beta), sigma, tau, ell)
+np_val = nngp_response_logp(X_sorted, y_sorted, m, beta, sigma, tau, ell,
+                             NNind, NNdist, NNdistM)
 
-C_test = exp_cov(coords_sorted[:3], coords_sorted[:3], sigma2_test, ell_test)
-f = pytensor.function([sigma2_test, ell_test], C_test)
-print(f(1.0, 0.3))
-
-
-sigma2_sym = pt.dscalar('sigma2')
-ell_sym = pt.dscalar('ell')
-
-B_loop, F_loop = compute_B_and_F(coords_sorted, neighbor_idx, sigma2_sym, ell_sym)
-B_scan, F_scan = compute_B_and_F_scan(coords_const, neighbor_idx_const, mask_const, sigma2_sym, ell_sym)
-
-f_loop = pytensor.function([sigma2_sym, ell_sym], [B_loop, F_loop])
-f_scan = pytensor.function([sigma2_sym, ell_sym], [B_scan, F_scan])
-
-B_loop_val, F_loop_val = f_loop(1.0, 0.3)
-B_scan_val, F_scan_val = f_scan(1.0, 0.3)
-
-print(np.allclose(B_loop_val, B_scan_val, atol=1e-4))
-print(np.allclose(F_loop_val, F_scan_val, atol=1e-5))
-
-print("B max difference:", np.max(np.abs(B_loop_val - B_scan_val)))
-print("F max difference:", np.max(np.abs(F_loop_val - F_scan_val)))
-
-# look at first few rows
-print("\nB loop first 5 rows:\n", B_loop_val[:5])
-print("\nB scan first 5 rows:\n", B_scan_val[:5])
-
-print("\nF loop:", F_loop_val[:5])
-print("\nF scan:", F_scan_val[:5])
-
-print("neighbor_idx first 5 rows:\n", neighbor_idx[:5])
-print("neighbor_idx_safe first 5 rows:\n", neighbor_idx_safe[:5])
-
-# check which rows differ
-for i in range(len(F_loop_val)):
-    if not np.allclose(F_loop_val[i], F_scan_val[i], atol=1e-5):
-        print(f"Row {i} differs:")
-        print(f"  loop: {F_loop_val[i]}")
-        print(f"  scan: {F_scan_val[i]}")
-        print(f"  neighbor_idx: {neighbor_idx[i]}")
-        print(f"  neighbor_idx_safe: {neighbor_idx_safe[i]}")
+# these are identical 
+print(f"Pytensor: {pt_val:.4f}")
+print(f"NumPy: {np_val:.4f}") 
+print(f"Difference: {abs(pt_val - np_val):.6f}")
